@@ -1,79 +1,133 @@
-"""Demo subscriber: every point of the building goes to InfluxDB as  points,point=<name> value=<x>  at its simulated time
-(database base_building for the baseline run, controlled_building for the controlled one).
-
-Points are the last level of the topics  demo/<run>/<point>  and  demo/controlled/setpoint/<zone>  (stored as
-setpoint_<zone>). A value outside the physical range of its point is dropped, and the lines are written in batches.
+#!/usr/bin/env python3
 """
-import json
+subscriber.py -- your subscriber (STUDENT FILE).
+
+The idea
+--------
+Your devices (devices/gateway.py) publish the readings of the building on the
+MQTT broker. A broker does not keep history: a message that nobody receives is
+lost. This script is the piece of a BMS that listens to the devices and keeps
+what they say, so that it can be plotted, queried and analysed later:
+
+    devices --MQTT--> broker --MQTT--> subscriber.py --> InfluxDB (time series database)
+                                            |
+                                            +--MQTT--> your own clean topics (HMI, other services)
+
+Real measurements are messy: a value can be missing, out of range, stuck, or
+come with a strange unit. Before storing a value you decide whether it is
+plausible, how to name it and in which unit to keep it.
+
+How it is run
+-------------
+It is a service: in "BMS > Control room" you press Start on iot/subscriber.py and
+it must keep running (listening) until you press Stop. If it crashes, the
+platform restarts it; if you save the file while it runs, it restarts with the
+new code. Everything you print() appears in its log in the Control room.
+Start it BEFORE the building, otherwise the first values are lost.
+
+Where the data go: InfluxDB 1.x
+-------------------------------
+* Address: environment variable INFLUX_URL (http://influxdb:8086); user and password
+  in INFLUX_USERNAME and INFLUX_PASSWORD (HTTP basic authentication).
+* Two databases already exist, one per run, and Grafana has a data source for each:
+      base_building        the baseline run
+      controlled_building  the controlled run
+* Writing: HTTP POST to  {INFLUX_URL}/write?db=<database>&precision=s  (or ms, ns)
+  with a body of one or more lines in the "line protocol":
+      <measurement>,<tag>=<value>,<tag>=<value> <field>=<value>,<field>=<value> <timestamp>
+  e.g.  zone_temperature,zone=kitchen,run=baseline value=20.4 1767225600
+  Tags are indexed text (what you filter and group by), fields are the values.
+  Guide: https://docs.influxdata.com/influxdb/v1/write_protocols/line_protocol_tutorial/
+  HTTP API: https://docs.influxdata.com/influxdb/v1/tools/api/
+* `requests` is installed (requests.post(url, params=..., data=..., auth=(user, password))).
+  The InfluxDB 1.x Python package `influxdb` is not.
+* The timestamp is the SIMULATED time carried by your payload, not the clock of the
+  computer. One HTTP request per value is slow: collect lines and write them in batches.
+* The schema (measurement names, tags, fields) is your design. Write it down: your
+  data notebooks and your Grafana dashboards will query it.
+
+MQTT with paho-mqtt (already installed)
+---------------------------------------
+    import paho.mqtt.client as mqtt
+    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="...")
+    client.on_connect = ...        subscribe here, so that a reconnection subscribes again
+    client.on_message = ...        (client, userdata, msg): msg.topic str, msg.payload bytes
+    client.connect(host, port)     host MQTT_BROKER_URL ("mosquitto"), port MQTT_BROKER_PORT (1883)
+    client.loop_forever()          keeps listening (blocks)
+    client.subscribe(topic, qos)   wildcards: + one level, # everything below
+    client.publish(topic, payload, qos=0, retain=False)
+Documentation: https://eclipse.dev/paho/files/paho.mqtt.python/html/client.html
+
+Topics starting with "platform/" are reserved for the platform: do not publish there.
+"""
 import os
-import threading
-import time
-from datetime import datetime, timezone
+import sys
 
-import paho.mqtt.client as mqtt
-import requests
-
-HOST = os.getenv("MQTT_BROKER_URL", "mosquitto")
-PORT = int(os.getenv("MQTT_BROKER_PORT", "1883"))
-INFLUX = os.getenv("INFLUX_URL", "http://influxdb:8086")
-AUTH = {"u": os.getenv("INFLUX_USERNAME", ""), "p": os.getenv("INFLUX_PASSWORD", "")}
-DATABASE = {"baseline": "base_building", "controlled": "controlled_building"}
-RANGE = {"temperature": (-40, 60), "outdoor_temperature": (-40, 60), "outdoor_humidity": (0, 100), "wind_speed": (0, 80),
-         "solar_direct": (0, 1500), "electricity_kw": (0, 1e4), "heating_kw": (0, 1e4), "setpoint": (0, 40)}   # by prefix of the point
-FLUSH_EVERY = 2.0                           # s
-
-pending = {"baseline": [], "controlled": []}
-lock = threading.Lock()
+MQTT_BROKER_URL = os.getenv("MQTT_BROKER_URL", "mosquitto")
+MQTT_BROKER_PORT = int(os.getenv("MQTT_BROKER_PORT", "1883"))
+INFLUX_URL = os.getenv("INFLUX_URL", "http://influxdb:8086")
+INFLUX_USERNAME = os.getenv("INFLUX_USERNAME", "")
+INFLUX_PASSWORD = os.getenv("INFLUX_PASSWORD", "")
 
 
-def plausible(point, value):
-    for prefix, (low, high) in RANGE.items():
-        if point.startswith(prefix):
-            return low <= value <= high
-    return True                              # the cumulative energies have no range
+# ===========================================================================
+# 1. What you listen to
+# ===========================================================================
+# Which topics carry the readings of your devices (the ones your gateway.py
+# publishes), and how you tell from a message which device, which quantity and
+# which run (baseline or controlled) it belongs to.
+#
+# TODO
 
 
-def on_message(client, userdata, msg):
-    if not msg.payload:                                      # a retained value cleared by the gateway
-        return
-    try:
-        parts = msg.topic.split("/")                         # demo/<run>/<point>  or  demo/<run>/setpoint/<zone>
-        run, point = parts[1], "_".join(parts[2:])
-        if run not in DATABASE or point in ("clock", "ack") or parts[2] == "cmd":
-            return
-        data = json.loads(msg.payload)
-        value = float(data["value"])
-        if not plausible(point, value):
-            print("dropped (out of range):", msg.topic, value, flush=True)
-            return
-        ts = datetime.fromisoformat(data["ts"]).replace(tzinfo=timezone.utc)
-        with lock:
-            pending[run].append(f"points,point={point} value={value} {int(ts.timestamp())}")
-    except (KeyError, IndexError, ValueError, TypeError):
-        print("not stored:", msg.topic, msg.payload[:80], flush=True)
+# ===========================================================================
+# 2. Clean and check
+# ===========================================================================
+# For every message:
+#   - read the payload; a malformed message must not stop the service;
+#   - names: map device names to the naming convention of your site;
+#   - units: convert if you want to store something else (J -> kWh, W -> kW, ...);
+#   - plausibility: physical range of each quantity, values that stop changing
+#     for too long (a stuck sensor), jumps that are too fast;
+#   - decide what to do with what fails: drop it, store it with a quality flag,
+#     raise an alarm on a topic of yours.
+#
+# TODO
 
 
-def flusher():
-    while True:
-        time.sleep(FLUSH_EVERY)
-        for run, database in DATABASE.items():
-            with lock:
-                lines, pending[run] = pending[run], []
-            if not lines:
-                continue
-            try:
-                r = requests.post(f"{INFLUX}/write", params={**AUTH, "db": database, "precision": "s"},
-                                  data="\n".join(lines), timeout=10)
-                r.raise_for_status()
-            except requests.RequestException as e:
-                print("InfluxDB did not answer, batch kept:", e, flush=True)
-                with lock:
-                    pending[run] = lines + pending[run]
+# ===========================================================================
+# 3. Store
+# ===========================================================================
+# Your schema in InfluxDB: measurement(s), tags, fields, timestamp; the database
+# of the right run; writing in batches (e.g. every N lines or every few
+# seconds) and what happens if InfluxDB does not answer (do not lose the batch).
+#
+# TODO
 
 
-threading.Thread(target=flusher, daemon=True).start()
-client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="subscriber")
-client.on_connect = lambda c, u, flags, rc, props: c.subscribe([("demo/+/#", 0)])
-client.on_message = on_message
-client.connect(HOST, PORT)
-client.loop_forever()
+# ===========================================================================
+# 4. Republish
+# ===========================================================================
+# The clean values on topics of your own (for your HMI in openHAB and for other
+# services): structure of the topics and of the payload.
+#
+# TODO
+
+
+# ===========================================================================
+# 5. The service
+# ===========================================================================
+# Connect to the broker, subscribe (in on_connect), handle every message with
+# the steps above, and keep running until the Control room stops you.
+#
+# TODO
+
+
+def main():
+    # TODO: replace these two lines with your subscriber (section 5).
+    print("TODO: the subscriber is not written yet (iot/subscriber.py).", flush=True)
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()

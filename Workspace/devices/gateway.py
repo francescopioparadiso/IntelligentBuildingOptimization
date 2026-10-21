@@ -1,180 +1,164 @@
-"""Demo gateway: the devices of the building, on MQTT.
-
-Sensors (every one publishes on  demo/<run>/<point>  a retained {"value", "unit", "ts"}; "ts" is the SIMULATED time):
-
-    temperature_<west|south|east|north>   zone air temperature, degC
-    outdoor_temperature, outdoor_humidity, wind_speed, solar_direct     the weather EnergyPlus uses
-    electricity_kw, heating_kw            mean power of the last step     (the FMU meters are joules per step)
-    electricity_kwh, heating_kwh          energy since the start of the run
-    clock                                 the simulated instant, the last message of every step (a "tick")
-
-The weather, the clock and the name of the run in progress are also published under  demo/site/<point>  (run, clock,
-outdoor_temperature, outdoor_humidity, wind_speed, solar_direct), for the HMIs: they show the site, whichever run is live.
-
-A sensor is published when it moved more than its deadband, and at least every HEARTBEAT steps, so that a silent
-sensor can be told from a dead one.
-
-Actuators (controlled run only): the heating setpoint of each zone.
-    demo/controlled/cmd/<zone>        {"value": degC}   what somebody asks (controller, operator): checked, clamped to the range
-    demo/controlled/setpoint/<zone>   {"value", "unit", "ts"}  retained: what the building really has
-In "sync" mode the gateway waits after every tick for  demo/controlled/ack  {"ts": <the tick's ts>}  (5 s at most).
+#!/usr/bin/env python3
 """
-import json
-import math
+gateway.py -- your device gateway (STUDENT FILE).
+
+The idea
+--------
+Imagine you were given a real building in which you installed sensors and
+actuators (you chose them in "Building & devices > Sensors & actuators"). Real
+IoT devices would publish their readings on an MQTT broker and receive commands
+from it. There is no physical building here: EnergyPlus, packed as an FMU,
+computes what those sensors would measure. This script plays the role of ALL
+your field devices:
+
+    EnergyPlus (FMU)  --values-->  gateway.py  --MQTT publish-->   broker  --> your subscriber, HMI, controller
+    EnergyPlus (FMU)  <--inputs--  gateway.py  <--MQTT subscribe--  broker  <-- your controller, operator
+
+Everything about how the devices talk is your design: topic names, payload
+format, how often a sensor publishes, how a command is accepted or refused.
+
+How it is run
+-------------
+You do not run it by hand. In "BMS > Control room" you press Start on the
+building: the platform runs this file once (working directory Workspace/devices)
+with three environment variables:
+
+    SBEP_RUN           "baseline"   native EnergyPlus control; the baseline FMU has NO
+                                    actuator inputs: you can only publish sensors.
+                       "controlled" the FMU has the actuator inputs you chose: commands
+                                    you receive can change the building.
+    SBEP_MODE          "fast"       step as fast as EnergyPlus can.
+                       "scaled"     wait SBEP_STEP_SECONDS of real time between steps.
+                       "sync"       wait for your controller at every step (a handshake
+                                    you design, e.g. publish a "tick", wait for an "ack").
+    SBEP_STEP_SECONDS  seconds of real time per step in "scaled" mode.
+
+The script must end with exit code 0 when the simulation is finished and a
+non-zero code if something went wrong. Everything you print() appears in the
+log of the Control room: print what helps you debug.
+
+Rules
+-----
+* Topics starting with "platform/" are reserved for the platform: do not use them.
+* Broker: host from the environment variable MQTT_BROKER_URL (default "mosquitto"),
+  port MQTT_BROKER_PORT (default 1883).
+* Both runs should publish the same sensors on comparable topics, and the data of
+  the two runs must be distinguishable (put the run in the topic or in the payload).
+
+The platform library: building.py
+---------------------------------
+`from building import Building, BuildingStopped` gives you the building. Its API:
+
+    b = Building(run)              run = "baseline" or "controlled"
+    b.outputs                      list of FMU output names  (your sensors)
+    b.inputs                       list of FMU input names   (your actuators; empty in baseline)
+    b.step_size, b.steps_total     seconds per step, number of steps of the run
+    b.start(initial)               start EnergyPlus; initial = {input name: value} or None
+    b.read()                       values at the current time (before the first step)
+    b.step()                       advance one step; returns
+                                   {"step": n, "time": seconds, "ts": "2026-01-01T00:10:00",
+                                    "values": {output name: value}}
+    b.set(name, value)             set an input; applied at the next step()
+    b.set_many({name: value})      same, for several inputs
+    b.done                         True when the last step has been made
+    b.close()                      stop EnergyPlus (or use "with Building(run) as b:")
+
+    BuildingStopped                raised by step() if EnergyPlus died: stop and exit non-zero.
+
+Use "ts" (the SIMULATED time) as the timestamp of your measurements, not the clock
+of the computer: a week of simulation can run in one minute.
+
+MQTT with paho-mqtt (already installed)
+---------------------------------------
+    import paho.mqtt.client as mqtt
+    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="...")
+    client.on_connect = ...        called when connected: subscribe there
+    client.on_message = ...        called for every message received: (client, userdata, msg)
+                                   msg.topic is a str, msg.payload is bytes
+    client.connect(host, port)
+    client.loop_start()            network loop in a background thread
+    client.subscribe(topic, qos)
+    client.publish(topic, payload, qos=0, retain=False)
+Documentation: https://eclipse.dev/paho/files/paho.mqtt.python/html/client.html
+Careful: on_message runs in another thread. Do not call b.set() from there
+directly: store the command, and apply it in your main loop before b.step().
+"""
 import os
 import sys
-import threading
-import time
 
-import paho.mqtt.client as mqtt
-from building import Building, BuildingStopped
+from building import Building
 
 RUN = os.getenv("SBEP_RUN", "baseline")
 MODE = os.getenv("SBEP_MODE", "fast")
 STEP_SECONDS = float(os.getenv("SBEP_STEP_SECONDS", "1.0"))
-HOST = os.getenv("MQTT_BROKER_URL", "mosquitto")
-PORT = int(os.getenv("MQTT_BROKER_PORT", "1883"))
-
-ZONES = ("west", "south", "east", "north")
-HEARTBEAT = 6                       # steps (one hour at 10 min): an unchanged sensor is published again
-ACK_TIMEOUT = 5.0                   # s, sync mode
-
-# point -> (FMU output, unit, deadband)
-SENSORS = {f"temperature_{z}": (f"Zone_Air_Temperature_ZONE{z.upper()}", "degC", 0.1) for z in ZONES}
-SENSORS.update({
-    "outdoor_temperature": ("Site_Outdoor_Air_Drybulb_Temperature_Environment", "degC", 0.1),
-    "outdoor_humidity": ("Site_Outdoor_Air_Relative_Humidity_Environment", "%", 1.0),
-    "wind_speed": ("Site_Wind_Speed_Environment", "m/s", 0.2),
-    "solar_direct": ("Site_Direct_Solar_Radiation_Rate_per_Area_Environment", "W/m2", 5.0),
-})
-SITE = ("outdoor_temperature", "outdoor_humidity", "wind_speed", "solar_direct")        # also under demo/site
-METERS = {"electricity": "Electricity_Facility", "heating": "DistrictHeating_Facility"}   # J per step
-ACTUATORS = {z: (f"ZONE{z.upper()}_Heating_Setpoint_FMU", 10.0, 30.0) for z in ZONES}     # FMU input, min, max
-DEFAULT = 12.0                      # degC, until somebody commands
-DEMO_DAYS = 7                       # the demo covers one week: both runs stop at the same simulated instant (the FMU is a year)
+MQTT_BROKER_URL = os.getenv("MQTT_BROKER_URL", "mosquitto")
+MQTT_BROKER_PORT = int(os.getenv("MQTT_BROKER_PORT", "1883"))
 
 
-class Gateway:
-    def __init__(self):
-        self.lock = threading.Lock()
-        self.commands = {}                       # zone -> setpoint asked since the last step
-        self.acked = ""                          # ts of the last ack received
-        self.ack_event = threading.Event()
-        self.published = {}                      # point -> (value, step) last published
-        self.energy = {k: 0.0 for k in METERS}   # kWh since the start
-        self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=f"gateway-{RUN}")
-        self.client.on_connect = self.on_connect
-        self.client.on_message = self.on_message
+# ===========================================================================
+# 1. Your devices
+# ===========================================================================
+# Describe your sensors and actuators: which FMU variable each one reads or
+# drives, its name in your installation, its unit, and the parameters it needs
+# (for a sensor: when it publishes; for an actuator: the range it accepts and
+# the value it holds until somebody commands it).
+# Start by running the building once: show_building() below prints the exact
+# names of the FMU outputs and inputs.
+#
+# TODO
 
-    # ---- MQTT side -----------------------------------------------------------------
-    def on_connect(self, client, userdata, flags, rc, props=None):
-        if RUN == "controlled":
-            client.subscribe([(f"demo/{RUN}/cmd/+", 0), (f"demo/{RUN}/ack", 0)])
 
-    def on_message(self, client, userdata, msg):
-        try:
-            data = json.loads(msg.payload)
-            if msg.topic.endswith("/ack"):
-                self.acked = str(data["ts"])
-                self.ack_event.set()
-                return
-            zone = msg.topic.rsplit("/", 1)[-1]
-            value = data["value"]
-            if zone not in ACTUATORS or isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
-                raise ValueError("not a setpoint")
-            _, low, high = ACTUATORS[zone]
-            with self.lock:
-                self.commands[zone] = min(max(float(value), low), high)
-        except (ValueError, KeyError, TypeError):
-            print("ignored:", msg.topic, msg.payload[:80], flush=True)
+# ===========================================================================
+# 2. Topics and payloads
+# ===========================================================================
+# Design the MQTT side of each device:
+#   - the topic a sensor publishes on, and the one an actuator listens on;
+#   - the payload: which fields (value, unit, timestamp, run, quality, ...)
+#     and in which format (JSON is the usual choice);
+#   - when a sensor publishes: every step, only when the value changed by more
+#     than a threshold (deadband), plus a periodic "I am alive" message
+#     (heartbeat) so that a silent sensor can be told apart from a dead one;
+#   - how a command is read and checked: a value outside the range or a
+#     malformed message must not reach the building.
+#
+# TODO
 
-    def publish(self, point, value, unit, ts, step, deadband=0.0, run=RUN):
-        last = self.published.get((run, point))
-        if last and abs(value - last[0]) <= deadband and step - last[1] < HEARTBEAT:
-            return
-        self.published[(run, point)] = (value, step)
-        self.client.publish(f"demo/{run}/{point}", json.dumps({"value": round(value, 3), "unit": unit, "ts": ts}), retain=True)
 
-    # ---- one step ------------------------------------------------------------------
-    def publish_step(self, r, step_seconds):
-        ts, values, step = r["ts"], r["values"], r["step"]
-        for point, (fmu, unit, deadband) in SENSORS.items():
-            self.publish(point, values[fmu], unit, ts, step, deadband)
-            if point in SITE:
-                self.publish(point, values[fmu], unit, ts, step, deadband, run="site")
-        for name, fmu in METERS.items():
-            joules = values[fmu]
-            self.energy[name] += joules / 3.6e6
-            self.publish(f"{name}_kw", joules / step_seconds / 1000.0, "kW", ts, step, 0.05)
-            self.publish(f"{name}_kwh", self.energy[name], "kWh", ts, step, 0.5)
-        self.client.publish(f"demo/{RUN}/clock", json.dumps({"value": ts, "ts": ts}), retain=True)
-        self.client.publish("demo/site/clock", json.dumps({"value": ts, "ts": ts}), retain=True)
+# ===========================================================================
+# 3. The gateway
+# ===========================================================================
+# The loop of a field gateway, in order:
+#   a. connect to the broker; in the controlled run, subscribe to the command
+#      topics of your actuators;
+#   b. open the building for RUN and start it (actuators at their default values);
+#   c. until the building is done:
+#        - apply the commands received since the last step,
+#        - advance one step,
+#        - publish the sensors that must be published,
+#        - wait according to MODE ("scaled": STEP_SECONDS; "sync": your handshake);
+#   d. close the building and the MQTT connection, exit with code 0;
+#      if EnergyPlus stops (BuildingStopped) exit with a non-zero code.
+#
+# TODO
 
-    def apply_commands(self, b):
-        """The commands received since the last step reach the building; what it really has is published."""
-        with self.lock:
-            asked, self.commands = self.commands, {}
-        if asked:
-            b.set_many({ACTUATORS[z][0]: v for z, v in asked.items()})
-            for zone, value in asked.items():
-                self.publish_setpoint(zone, value, b.timestamp)
 
-    def clear_retained(self):
-        """A new run starts from nothing: what the last run left retained would look alive in an HMI."""
-        topics = [f"demo/{RUN}/{p}" for p in SENSORS] + [f"demo/{RUN}/{k}_{u}" for k in METERS for u in ("kw", "kwh")]
-        topics += [f"demo/{RUN}/clock"] + [f"demo/{RUN}/setpoint/{z}" for z in ZONES]
-        topics += [f"demo/site/{p}" for p in SITE] + ["demo/site/clock"]
-        for topic in topics:
-            self.client.publish(topic, b"", retain=True)
-        self.client.publish("demo/site/run", json.dumps({"value": RUN}), retain=True)
+# ===========================================================================
+# Given: list what your building exposes
+# ===========================================================================
+def show_building():
+    """Print the FMU outputs (sensors) and inputs (actuators) of this run."""
+    with Building(RUN, publish_status=False) as b:
+        print(f"Run {RUN}: {b.steps_total} steps of {b.step_size:g} s", flush=True)
+        print("FMU outputs (sensors):  ", b.outputs, flush=True)
+        print("FMU inputs (actuators): ", b.inputs, flush=True)
 
-    def publish_setpoint(self, zone, value, ts):
-        self.client.publish(f"demo/{RUN}/setpoint/{zone}", json.dumps({"value": value, "unit": "degC", "ts": ts}), retain=True)
 
-    def wait_for_ack(self, ts):
-        deadline = time.time() + ACK_TIMEOUT
-        while self.acked != ts:
-            left = deadline - time.time()
-            if left <= 0 or not self.ack_event.wait(left):
-                print(f"no ack for {ts}", flush=True)
-                return
-            self.ack_event.clear()
-
-    def run(self):
-        self.client.connect(HOST, PORT)
-        self.client.loop_start()
-        self.clear_retained()
-        try:
-            with Building(RUN) as b:
-                controlled = bool(b.inputs)
-                initial = {fmu: DEFAULT for fmu, _, _ in ACTUATORS.values()} if controlled else None
-                b.start(initial)
-                if controlled:
-                    # start(initial) alone does not hold the setpoints (the zone drifts to 6 degC with no heating): set them
-                    b.set_many(initial)
-                    for zone in ACTUATORS:
-                        self.publish_setpoint(zone, DEFAULT, b.timestamp)
-                last_step = min(b.steps_total, round(DEMO_DAYS * 86400 / b.step_size))
-                while b.step_no < last_step:
-                    if controlled:
-                        self.apply_commands(b)
-                    r = b.step()
-                    self.publish_step(r, b.step_size)
-                    if MODE == "scaled":
-                        time.sleep(STEP_SECONDS)
-                    elif MODE == "sync" and controlled:
-                        self.wait_for_ack(r["ts"])
-                if not b.done:
-                    b.report("finished", f"{last_step} steps completed ({DEMO_DAYS} days)")
-                print(f"done: {last_step} steps", flush=True)
-        except BuildingStopped:
-            print("EnergyPlus stopped", flush=True)
-            sys.exit(1)
-        finally:
-            time.sleep(0.5)                      # let the last messages leave
-            self.client.loop_stop()
-            self.client.disconnect()
+def main():
+    show_building()
+    # TODO: replace these two lines with your gateway (section 3).
+    print("TODO: the gateway is not written yet (devices/gateway.py).", flush=True)
+    sys.exit(2)
 
 
 if __name__ == "__main__":
-    Gateway().run()
+    main()
